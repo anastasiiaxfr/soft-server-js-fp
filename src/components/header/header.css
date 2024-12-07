@@ -1,0 +1,40 @@
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  margin-bottom: 24px;
+  font-weight: 500;
+  /* background-color: var(--dark);
+    color: var(--light); */
+  border-bottom: 2px solid var(--main);
+}
+
+.menu {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 24px;
+}
+
+.menu__item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: inherit;
+  cursor: pointer;
+  user-select: none;
+  text-decoration: none;
+}
+
+.menu__counter {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 4px;
+  border: 2px solid var(--main);
+}

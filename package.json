@@ -1,0 +1,28 @@
+{
+  "name": "js",
+  "version": "1.0.0",
+  "description": "SoftServer JS final project",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "live-server",
+    "build": "rollup -c"
+  },
+  "author": "Anastasiia_Berest",
+  "license": "ISC",
+  "devDependencies": {
+    "@eslint/js": "^9.16.0",
+    "eslint": "^9.16.0",
+    "globals": "^15.13.0",
+    "rollup": "^4.28.0",
+    "rollup-plugin-postcss": "^4.0.2"
+  },
+  "dependencies": {
+    "@rollup/plugin-node-resolve": "^15.3.0",
+    "on-change": "^5.0.1",
+    "rollup-plugin-import-css": "^3.5.7",
+    "rollup-plugin-livereload": "^2.0.5",
+    "rollup-plugin-serve": "^1.1.1",
+    "rollup-plugin-watch": "^1.0.4"
+  }
+}

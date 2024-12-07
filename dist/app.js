@@ -1,0 +1,1628 @@
+(function () {
+    'use strict';
+
+    class AbstractView {
+        constructor(){
+            this.app = document.getElementById('root');
+        }
+
+        setTitle(title){
+            document.title = title;
+        }
+
+        render(){
+            return;
+        }
+
+        destroy(){
+            return;
+        }
+    }
+
+    const PATH_SEPARATOR = '.';
+    const TARGET = Symbol('target');
+    const UNSUBSCRIBE = Symbol('unsubscribe');
+
+    function isBuiltinWithMutableMethods(value) {
+    	return value instanceof Date
+    		|| value instanceof Set
+    		|| value instanceof Map
+    		|| value instanceof WeakSet
+    		|| value instanceof WeakMap
+    		|| ArrayBuffer.isView(value);
+    }
+
+    function isBuiltinWithoutMutableMethods(value) {
+    	return (typeof value === 'object' ? value === null : typeof value !== 'function') || value instanceof RegExp;
+    }
+
+    var isArray = Array.isArray;
+
+    function isSymbol(value) {
+    	return typeof value === 'symbol';
+    }
+
+    const path = {
+    	after(path, subPath) {
+    		if (isArray(path)) {
+    			return path.slice(subPath.length);
+    		}
+
+    		if (subPath === '') {
+    			return path;
+    		}
+
+    		return path.slice(subPath.length + 1);
+    	},
+    	concat(path, key) {
+    		if (isArray(path)) {
+    			path = [...path];
+
+    			if (key) {
+    				path.push(key);
+    			}
+
+    			return path;
+    		}
+
+    		if (key && key.toString !== undefined) {
+    			if (path !== '') {
+    				path += PATH_SEPARATOR;
+    			}
+
+    			if (isSymbol(key)) {
+    				return path + key.toString();
+    			}
+
+    			return path + key;
+    		}
+
+    		return path;
+    	},
+    	initial(path) {
+    		if (isArray(path)) {
+    			return path.slice(0, -1);
+    		}
+
+    		if (path === '') {
+    			return path;
+    		}
+
+    		const index = path.lastIndexOf(PATH_SEPARATOR);
+
+    		if (index === -1) {
+    			return '';
+    		}
+
+    		return path.slice(0, index);
+    	},
+    	last(path) {
+    		if (isArray(path)) {
+    			return path.at(-1) ?? '';
+    		}
+
+    		if (path === '') {
+    			return path;
+    		}
+
+    		const index = path.lastIndexOf(PATH_SEPARATOR);
+
+    		if (index === -1) {
+    			return path;
+    		}
+
+    		return path.slice(index + 1);
+    	},
+    	walk(path, callback) {
+    		if (isArray(path)) {
+    			for (const key of path) {
+    				callback(key);
+    			}
+    		} else if (path !== '') {
+    			let position = 0;
+    			let index = path.indexOf(PATH_SEPARATOR);
+
+    			if (index === -1) {
+    				callback(path);
+    			} else {
+    				while (position < path.length) {
+    					if (index === -1) {
+    						index = path.length;
+    					}
+
+    					callback(path.slice(position, index));
+
+    					position = index + 1;
+    					index = path.indexOf(PATH_SEPARATOR, position);
+    				}
+    			}
+    		}
+    	},
+    	get(object, path) {
+    		this.walk(path, key => {
+    			if (object) {
+    				object = object[key];
+    			}
+    		});
+
+    		return object;
+    	},
+    	isSubPath(path, subPath) {
+    		if (isArray(path)) {
+    			if (path.length < subPath.length) {
+    				return false;
+    			}
+
+    			// eslint-disable-next-line unicorn/no-for-loop
+    			for (let i = 0; i < subPath.length; i++) {
+    				if (path[i] !== subPath[i]) {
+    					return false;
+    				}
+    			}
+
+    			return true;
+    		}
+
+    		if (path.length < subPath.length) {
+    			return false;
+    		}
+
+    		if (path === subPath) {
+    			return true;
+    		}
+
+    		if (path.startsWith(subPath)) {
+    			return path[subPath.length] === PATH_SEPARATOR;
+    		}
+
+    		return false;
+    	},
+    	isRootPath(path) {
+    		if (isArray(path)) {
+    			return path.length === 0;
+    		}
+
+    		return path === '';
+    	},
+    };
+
+    function isIterator(value) {
+    	return typeof value === 'object' && typeof value.next === 'function';
+    }
+
+    // eslint-disable-next-line max-params
+    function wrapIterator(iterator, target, thisArgument, applyPath, prepareValue) {
+    	const originalNext = iterator.next;
+
+    	if (target.name === 'entries') {
+    		iterator.next = function () {
+    			const result = originalNext.call(this);
+
+    			if (result.done === false) {
+    				result.value[0] = prepareValue(
+    					result.value[0],
+    					target,
+    					result.value[0],
+    					applyPath,
+    				);
+    				result.value[1] = prepareValue(
+    					result.value[1],
+    					target,
+    					result.value[0],
+    					applyPath,
+    				);
+    			}
+
+    			return result;
+    		};
+    	} else if (target.name === 'values') {
+    		const keyIterator = thisArgument[TARGET].keys();
+
+    		iterator.next = function () {
+    			const result = originalNext.call(this);
+
+    			if (result.done === false) {
+    				result.value = prepareValue(
+    					result.value,
+    					target,
+    					keyIterator.next().value,
+    					applyPath,
+    				);
+    			}
+
+    			return result;
+    		};
+    	} else {
+    		iterator.next = function () {
+    			const result = originalNext.call(this);
+
+    			if (result.done === false) {
+    				result.value = prepareValue(
+    					result.value,
+    					target,
+    					result.value,
+    					applyPath,
+    				);
+    			}
+
+    			return result;
+    		};
+    	}
+
+    	return iterator;
+    }
+
+    function ignoreProperty(cache, options, property) {
+    	return cache.isUnsubscribed
+    		|| (options.ignoreSymbols && isSymbol(property))
+    		|| (options.ignoreUnderscores && property.charAt(0) === '_')
+    		|| ('ignoreKeys' in options && options.ignoreKeys.includes(property));
+    }
+
+    /**
+    @class Cache
+    @private
+    */
+    class Cache {
+    	constructor(equals) {
+    		this._equals = equals;
+    		this._proxyCache = new WeakMap();
+    		this._pathCache = new WeakMap();
+    		this.isUnsubscribed = false;
+    	}
+
+    	_getDescriptorCache() {
+    		if (this._descriptorCache === undefined) {
+    			this._descriptorCache = new WeakMap();
+    		}
+
+    		return this._descriptorCache;
+    	}
+
+    	_getProperties(target) {
+    		const descriptorCache = this._getDescriptorCache();
+    		let properties = descriptorCache.get(target);
+
+    		if (properties === undefined) {
+    			properties = {};
+    			descriptorCache.set(target, properties);
+    		}
+
+    		return properties;
+    	}
+
+    	_getOwnPropertyDescriptor(target, property) {
+    		if (this.isUnsubscribed) {
+    			return Reflect.getOwnPropertyDescriptor(target, property);
+    		}
+
+    		const properties = this._getProperties(target);
+    		let descriptor = properties[property];
+
+    		if (descriptor === undefined) {
+    			descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+    			properties[property] = descriptor;
+    		}
+
+    		return descriptor;
+    	}
+
+    	getProxy(target, path, handler, proxyTarget) {
+    		if (this.isUnsubscribed) {
+    			return target;
+    		}
+
+    		const reflectTarget = target[proxyTarget];
+    		const source = reflectTarget ?? target;
+
+    		this._pathCache.set(source, path);
+
+    		let proxy = this._proxyCache.get(source);
+
+    		if (proxy === undefined) {
+    			proxy = reflectTarget === undefined
+    				? new Proxy(target, handler)
+    				: target;
+
+    			this._proxyCache.set(source, proxy);
+    		}
+
+    		return proxy;
+    	}
+
+    	getPath(target) {
+    		return this.isUnsubscribed ? undefined : this._pathCache.get(target);
+    	}
+
+    	isDetached(target, object) {
+    		return !Object.is(target, path.get(object, this.getPath(target)));
+    	}
+
+    	defineProperty(target, property, descriptor) {
+    		if (!Reflect.defineProperty(target, property, descriptor)) {
+    			return false;
+    		}
+
+    		if (!this.isUnsubscribed) {
+    			this._getProperties(target)[property] = descriptor;
+    		}
+
+    		return true;
+    	}
+
+    	setProperty(target, property, value, receiver, previous) { // eslint-disable-line max-params
+    		if (!this._equals(previous, value) || !(property in target)) {
+    			const descriptor = this._getOwnPropertyDescriptor(target, property);
+
+    			if (descriptor !== undefined && 'set' in descriptor) {
+    				return Reflect.set(target, property, value, receiver);
+    			}
+
+    			return Reflect.set(target, property, value);
+    		}
+
+    		return true;
+    	}
+
+    	deleteProperty(target, property, previous) {
+    		if (Reflect.deleteProperty(target, property)) {
+    			if (!this.isUnsubscribed) {
+    				const properties = this._getDescriptorCache().get(target);
+
+    				if (properties) {
+    					delete properties[property];
+    					this._pathCache.delete(previous);
+    				}
+    			}
+
+    			return true;
+    		}
+
+    		return false;
+    	}
+
+    	isSameDescriptor(a, target, property) {
+    		const b = this._getOwnPropertyDescriptor(target, property);
+
+    		return a !== undefined
+    			&& b !== undefined
+    			&& Object.is(a.value, b.value)
+    			&& (a.writable || false) === (b.writable || false)
+    			&& (a.enumerable || false) === (b.enumerable || false)
+    			&& (a.configurable || false) === (b.configurable || false)
+    			&& a.get === b.get
+    			&& a.set === b.set;
+    	}
+
+    	isGetInvariant(target, property) {
+    		const descriptor = this._getOwnPropertyDescriptor(target, property);
+
+    		return descriptor !== undefined
+    			&& descriptor.configurable !== true
+    			&& descriptor.writable !== true;
+    	}
+
+    	unsubscribe() {
+    		this._descriptorCache = null;
+    		this._pathCache = null;
+    		this._proxyCache = null;
+    		this.isUnsubscribed = true;
+    	}
+    }
+
+    function isObject(value) {
+    	return toString.call(value) === '[object Object]';
+    }
+
+    function isDiffCertain() {
+    	return true;
+    }
+
+    function isDiffArrays(clone, value) {
+    	return clone.length !== value.length || clone.some((item, index) => value[index] !== item);
+    }
+
+    const IMMUTABLE_OBJECT_METHODS = new Set([
+    	'hasOwnProperty',
+    	'isPrototypeOf',
+    	'propertyIsEnumerable',
+    	'toLocaleString',
+    	'toString',
+    	'valueOf',
+    ]);
+
+    const IMMUTABLE_ARRAY_METHODS = new Set([
+    	'concat',
+    	'includes',
+    	'indexOf',
+    	'join',
+    	'keys',
+    	'lastIndexOf',
+    ]);
+
+    const MUTABLE_ARRAY_METHODS = {
+    	push: isDiffCertain,
+    	pop: isDiffCertain,
+    	shift: isDiffCertain,
+    	unshift: isDiffCertain,
+    	copyWithin: isDiffArrays,
+    	reverse: isDiffArrays,
+    	sort: isDiffArrays,
+    	splice: isDiffArrays,
+    	flat: isDiffArrays,
+    	fill: isDiffArrays,
+    };
+
+    const HANDLED_ARRAY_METHODS = new Set([
+    	...IMMUTABLE_OBJECT_METHODS,
+    	...IMMUTABLE_ARRAY_METHODS,
+    	...Object.keys(MUTABLE_ARRAY_METHODS),
+    ]);
+
+    function isDiffSets(clone, value) {
+    	if (clone.size !== value.size) {
+    		return true;
+    	}
+
+    	for (const element of clone) {
+    		if (!value.has(element)) {
+    			return true;
+    		}
+    	}
+
+    	return false;
+    }
+
+    const COLLECTION_ITERATOR_METHODS = [
+    	'keys',
+    	'values',
+    	'entries',
+    ];
+
+    const IMMUTABLE_SET_METHODS = new Set([
+    	'has',
+    	'toString',
+    ]);
+
+    const MUTABLE_SET_METHODS = {
+    	add: isDiffSets,
+    	clear: isDiffSets,
+    	delete: isDiffSets,
+    	forEach: isDiffSets,
+    };
+
+    const HANDLED_SET_METHODS = new Set([
+    	...IMMUTABLE_SET_METHODS,
+    	...Object.keys(MUTABLE_SET_METHODS),
+    	...COLLECTION_ITERATOR_METHODS,
+    ]);
+
+    function isDiffMaps(clone, value) {
+    	if (clone.size !== value.size) {
+    		return true;
+    	}
+
+    	let bValue;
+    	for (const [key, aValue] of clone) {
+    		bValue = value.get(key);
+
+    		if (bValue !== aValue || (bValue === undefined && !value.has(key))) {
+    			return true;
+    		}
+    	}
+
+    	return false;
+    }
+
+    const IMMUTABLE_MAP_METHODS = new Set([...IMMUTABLE_SET_METHODS, 'get']);
+
+    const MUTABLE_MAP_METHODS = {
+    	set: isDiffMaps,
+    	clear: isDiffMaps,
+    	delete: isDiffMaps,
+    	forEach: isDiffMaps,
+    };
+
+    const HANDLED_MAP_METHODS = new Set([
+    	...IMMUTABLE_MAP_METHODS,
+    	...Object.keys(MUTABLE_MAP_METHODS),
+    	...COLLECTION_ITERATOR_METHODS,
+    ]);
+
+    class CloneObject {
+    	constructor(value, path, argumentsList, hasOnValidate) {
+    		this._path = path;
+    		this._isChanged = false;
+    		this._clonedCache = new Set();
+    		this._hasOnValidate = hasOnValidate;
+    		this._changes = hasOnValidate ? [] : null;
+
+    		this.clone = path === undefined ? value : this._shallowClone(value);
+    	}
+
+    	static isHandledMethod(name) {
+    		return IMMUTABLE_OBJECT_METHODS.has(name);
+    	}
+
+    	_shallowClone(value) {
+    		let clone = value;
+
+    		if (isObject(value)) {
+    			clone = {...value};
+    		} else if (isArray(value) || ArrayBuffer.isView(value)) {
+    			clone = [...value];
+    		} else if (value instanceof Date) {
+    			clone = new Date(value);
+    		} else if (value instanceof Set) {
+    			clone = new Set([...value].map(item => this._shallowClone(item)));
+    		} else if (value instanceof Map) {
+    			clone = new Map();
+
+    			for (const [key, item] of value.entries()) {
+    				clone.set(key, this._shallowClone(item));
+    			}
+    		}
+
+    		this._clonedCache.add(clone);
+
+    		return clone;
+    	}
+
+    	preferredThisArg(isHandledMethod, name, thisArgument, thisProxyTarget) {
+    		if (isHandledMethod) {
+    			if (isArray(thisProxyTarget)) {
+    				this._onIsChanged = MUTABLE_ARRAY_METHODS[name];
+    			} else if (thisProxyTarget instanceof Set) {
+    				this._onIsChanged = MUTABLE_SET_METHODS[name];
+    			} else if (thisProxyTarget instanceof Map) {
+    				this._onIsChanged = MUTABLE_MAP_METHODS[name];
+    			}
+
+    			return thisProxyTarget;
+    		}
+
+    		return thisArgument;
+    	}
+
+    	update(fullPath, property, value) {
+    		const changePath = path.after(fullPath, this._path);
+
+    		if (property !== 'length') {
+    			let object = this.clone;
+
+    			path.walk(changePath, key => {
+    				if (object?.[key]) {
+    					if (!this._clonedCache.has(object[key])) {
+    						object[key] = this._shallowClone(object[key]);
+    					}
+
+    					object = object[key];
+    				}
+    			});
+
+    			if (this._hasOnValidate) {
+    				this._changes.push({
+    					path: changePath,
+    					property,
+    					previous: value,
+    				});
+    			}
+
+    			if (object?.[property]) {
+    				object[property] = value;
+    			}
+    		}
+
+    		this._isChanged = true;
+    	}
+
+    	undo(object) {
+    		let change;
+
+    		for (let index = this._changes.length - 1; index !== -1; index--) {
+    			change = this._changes[index];
+
+    			path.get(object, change.path)[change.property] = change.previous;
+    		}
+    	}
+
+    	isChanged(value) {
+    		return this._onIsChanged === undefined
+    			? this._isChanged
+    			: this._onIsChanged(this.clone, value);
+    	}
+
+    	isPathApplicable(changePath) {
+    		return path.isRootPath(this._path) || path.isSubPath(changePath, this._path);
+    	}
+    }
+
+    class CloneArray extends CloneObject {
+    	static isHandledMethod(name) {
+    		return HANDLED_ARRAY_METHODS.has(name);
+    	}
+    }
+
+    class CloneDate extends CloneObject {
+    	undo(object) {
+    		object.setTime(this.clone.getTime());
+    	}
+
+    	isChanged(value, equals) {
+    		return !equals(this.clone.valueOf(), value.valueOf());
+    	}
+    }
+
+    class CloneSet extends CloneObject {
+    	static isHandledMethod(name) {
+    		return HANDLED_SET_METHODS.has(name);
+    	}
+
+    	undo(object) {
+    		for (const value of this.clone) {
+    			object.add(value);
+    		}
+
+    		for (const value of object) {
+    			if (!this.clone.has(value)) {
+    				object.delete(value);
+    			}
+    		}
+    	}
+    }
+
+    class CloneMap extends CloneObject {
+    	static isHandledMethod(name) {
+    		return HANDLED_MAP_METHODS.has(name);
+    	}
+
+    	undo(object) {
+    		for (const [key, value] of this.clone.entries()) {
+    			object.set(key, value);
+    		}
+
+    		for (const key of object.keys()) {
+    			if (!this.clone.has(key)) {
+    				object.delete(key);
+    			}
+    		}
+    	}
+    }
+
+    class CloneWeakSet extends CloneObject {
+    	constructor(value, path, argumentsList, hasOnValidate) {
+    		super(undefined, path, argumentsList, hasOnValidate);
+
+    		this._argument1 = argumentsList[0];
+    		this._weakValue = value.has(this._argument1);
+    	}
+
+    	isChanged(value) {
+    		return this._weakValue !== value.has(this._argument1);
+    	}
+
+    	undo(object) {
+    		if (this._weakValue && !object.has(this._argument1)) {
+    			object.add(this._argument1);
+    		} else {
+    			object.delete(this._argument1);
+    		}
+    	}
+    }
+
+    class CloneWeakMap extends CloneObject {
+    	constructor(value, path, argumentsList, hasOnValidate) {
+    		super(undefined, path, argumentsList, hasOnValidate);
+
+    		this._weakKey = argumentsList[0];
+    		this._weakHas = value.has(this._weakKey);
+    		this._weakValue = value.get(this._weakKey);
+    	}
+
+    	isChanged(value) {
+    		return this._weakValue !== value.get(this._weakKey);
+    	}
+
+    	undo(object) {
+    		const weakHas = object.has(this._weakKey);
+
+    		if (this._weakHas && !weakHas) {
+    			object.set(this._weakKey, this._weakValue);
+    		} else if (!this._weakHas && weakHas) {
+    			object.delete(this._weakKey);
+    		} else if (this._weakValue !== object.get(this._weakKey)) {
+    			object.set(this._weakKey, this._weakValue);
+    		}
+    	}
+    }
+
+    class SmartClone {
+    	constructor(hasOnValidate) {
+    		this._stack = [];
+    		this._hasOnValidate = hasOnValidate;
+    	}
+
+    	static isHandledType(value) {
+    		return isObject(value)
+    			|| isArray(value)
+    			|| isBuiltinWithMutableMethods(value);
+    	}
+
+    	static isHandledMethod(target, name) {
+    		if (isObject(target)) {
+    			return CloneObject.isHandledMethod(name);
+    		}
+
+    		if (isArray(target)) {
+    			return CloneArray.isHandledMethod(name);
+    		}
+
+    		if (target instanceof Set) {
+    			return CloneSet.isHandledMethod(name);
+    		}
+
+    		if (target instanceof Map) {
+    			return CloneMap.isHandledMethod(name);
+    		}
+
+    		return isBuiltinWithMutableMethods(target);
+    	}
+
+    	get isCloning() {
+    		return this._stack.length > 0;
+    	}
+
+    	start(value, path, argumentsList) {
+    		let CloneClass = CloneObject;
+
+    		if (isArray(value)) {
+    			CloneClass = CloneArray;
+    		} else if (value instanceof Date) {
+    			CloneClass = CloneDate;
+    		} else if (value instanceof Set) {
+    			CloneClass = CloneSet;
+    		} else if (value instanceof Map) {
+    			CloneClass = CloneMap;
+    		} else if (value instanceof WeakSet) {
+    			CloneClass = CloneWeakSet;
+    		} else if (value instanceof WeakMap) {
+    			CloneClass = CloneWeakMap;
+    		}
+
+    		this._stack.push(new CloneClass(value, path, argumentsList, this._hasOnValidate));
+    	}
+
+    	update(fullPath, property, value) {
+    		this._stack.at(-1).update(fullPath, property, value);
+    	}
+
+    	preferredThisArg(target, thisArgument, thisProxyTarget) {
+    		const {name} = target;
+    		const isHandledMethod = SmartClone.isHandledMethod(thisProxyTarget, name);
+
+    		return this._stack.at(-1)
+    			.preferredThisArg(isHandledMethod, name, thisArgument, thisProxyTarget);
+    	}
+
+    	isChanged(isMutable, value, equals) {
+    		return this._stack.at(-1).isChanged(isMutable, value, equals);
+    	}
+
+    	isPartOfClone(changePath) {
+    		return this._stack.at(-1).isPathApplicable(changePath);
+    	}
+
+    	undo(object) {
+    		if (this._previousClone !== undefined) {
+    			this._previousClone.undo(object);
+    		}
+    	}
+
+    	stop() {
+    		this._previousClone = this._stack.pop();
+
+    		return this._previousClone.clone;
+    	}
+    }
+
+    /* eslint-disable unicorn/prefer-spread */
+
+    const defaultOptions = {
+    	equals: Object.is,
+    	isShallow: false,
+    	pathAsArray: false,
+    	ignoreSymbols: false,
+    	ignoreUnderscores: false,
+    	ignoreDetached: false,
+    	details: false,
+    };
+
+    const onChange = (object, onChange, options = {}) => {
+    	options = {
+    		...defaultOptions,
+    		...options,
+    	};
+
+    	const proxyTarget = Symbol('ProxyTarget');
+    	const {equals, isShallow, ignoreDetached, details} = options;
+    	const cache = new Cache(equals);
+    	const hasOnValidate = typeof options.onValidate === 'function';
+    	const smartClone = new SmartClone(hasOnValidate);
+
+    	// eslint-disable-next-line max-params
+    	const validate = (target, property, value, previous, applyData) => !hasOnValidate
+    		|| smartClone.isCloning
+    		|| options.onValidate(path.concat(cache.getPath(target), property), value, previous, applyData) === true;
+
+    	const handleChangeOnTarget = (target, property, value, previous) => {
+    		if (
+    			!ignoreProperty(cache, options, property)
+    			&& !(ignoreDetached && cache.isDetached(target, object))
+    		) {
+    			handleChange(cache.getPath(target), property, value, previous);
+    		}
+    	};
+
+    	// eslint-disable-next-line max-params
+    	const handleChange = (changePath, property, value, previous, applyData) => {
+    		if (smartClone.isCloning && smartClone.isPartOfClone(changePath)) {
+    			smartClone.update(changePath, property, previous);
+    		} else {
+    			onChange(path.concat(changePath, property), value, previous, applyData);
+    		}
+    	};
+
+    	const getProxyTarget = value => value
+    		? (value[proxyTarget] ?? value)
+    		: value;
+
+    	const prepareValue = (value, target, property, basePath) => {
+    		if (
+    			isBuiltinWithoutMutableMethods(value)
+    			|| property === 'constructor'
+    			|| (isShallow && !SmartClone.isHandledMethod(target, property))
+    			|| ignoreProperty(cache, options, property)
+    			|| cache.isGetInvariant(target, property)
+    			|| (ignoreDetached && cache.isDetached(target, object))
+    		) {
+    			return value;
+    		}
+
+    		if (basePath === undefined) {
+    			basePath = cache.getPath(target);
+    		}
+
+    		/*
+      		Check for circular references.
+
+      		If the value already has a corresponding path/proxy,
+    		and if the path corresponds to one of the parents,
+    		then we are on a circular case, where the child is pointing to their parent.
+    		In this case we return the proxy object with the shortest path.
+      		*/
+    		const childPath = path.concat(basePath, property);
+    		const existingPath = cache.getPath(value);
+
+    		if (existingPath && isSameObjectTree(childPath, existingPath)) {
+    			// We are on the same object tree but deeper, so we use the parent path.
+    			return cache.getProxy(value, existingPath, handler, proxyTarget);
+    		}
+
+    		return cache.getProxy(value, childPath, handler, proxyTarget);
+    	};
+
+    	/*
+    	Returns true if `childPath` is a subpath of `existingPath`
+    	(if childPath starts with existingPath). Otherwise, it returns false.
+
+     	It also returns false if the 2 paths are identical.
+
+     	For example:
+    	- childPath    = group.layers.0.parent.layers.0.value
+    	- existingPath = group.layers.0.parent
+    	*/
+    	const isSameObjectTree = (childPath, existingPath) => {
+    		if (isSymbol(childPath) || childPath.length <= existingPath.length) {
+    			return false;
+    		}
+
+    		if (isArray(existingPath) && existingPath.length === 0) {
+    			return false;
+    		}
+
+    		const childParts = isArray(childPath) ? childPath : childPath.split(PATH_SEPARATOR);
+    		const existingParts = isArray(existingPath) ? existingPath : existingPath.split(PATH_SEPARATOR);
+
+    		if (childParts.length <= existingParts.length) {
+    			return false;
+    		}
+
+    		return !(existingParts.some((part, index) => part !== childParts[index]));
+    	};
+
+    	const handler = {
+    		get(target, property, receiver) {
+    			if (isSymbol(property)) {
+    				if (property === proxyTarget || property === TARGET) {
+    					return target;
+    				}
+
+    				if (
+    					property === UNSUBSCRIBE
+    					&& !cache.isUnsubscribed
+    					&& cache.getPath(target).length === 0
+    				) {
+    					cache.unsubscribe();
+    					return target;
+    				}
+    			}
+
+    			const value = isBuiltinWithMutableMethods(target)
+    				? Reflect.get(target, property)
+    				: Reflect.get(target, property, receiver);
+
+    			return prepareValue(value, target, property);
+    		},
+
+    		set(target, property, value, receiver) {
+    			value = getProxyTarget(value);
+
+    			const reflectTarget = target[proxyTarget] ?? target;
+    			const previous = reflectTarget[property];
+
+    			if (equals(previous, value) && property in target) {
+    				return true;
+    			}
+
+    			const isValid = validate(target, property, value, previous);
+
+    			if (
+    				isValid
+    				&& cache.setProperty(reflectTarget, property, value, receiver, previous)
+    			) {
+    				handleChangeOnTarget(target, property, target[property], previous);
+
+    				return true;
+    			}
+
+    			return !isValid;
+    		},
+
+    		defineProperty(target, property, descriptor) {
+    			if (!cache.isSameDescriptor(descriptor, target, property)) {
+    				const previous = target[property];
+
+    				if (
+    					validate(target, property, descriptor.value, previous)
+    					&& cache.defineProperty(target, property, descriptor, previous)
+    				) {
+    					handleChangeOnTarget(target, property, descriptor.value, previous);
+    				}
+    			}
+
+    			return true;
+    		},
+
+    		deleteProperty(target, property) {
+    			if (!Reflect.has(target, property)) {
+    				return true;
+    			}
+
+    			const previous = Reflect.get(target, property);
+    			const isValid = validate(target, property, undefined, previous);
+
+    			if (
+    				isValid
+    				&& cache.deleteProperty(target, property, previous)
+    			) {
+    				handleChangeOnTarget(target, property, undefined, previous);
+
+    				return true;
+    			}
+
+    			return !isValid;
+    		},
+
+    		apply(target, thisArg, argumentsList) {
+    			const thisProxyTarget = thisArg[proxyTarget] ?? thisArg;
+
+    			if (cache.isUnsubscribed) {
+    				return Reflect.apply(target, thisProxyTarget, argumentsList);
+    			}
+
+    			if (
+    				(details === false
+    					|| (details !== true && !details.includes(target.name)))
+    				&& SmartClone.isHandledType(thisProxyTarget)
+    			) {
+    				let applyPath = path.initial(cache.getPath(target));
+    				const isHandledMethod = SmartClone.isHandledMethod(thisProxyTarget, target.name);
+
+    				smartClone.start(thisProxyTarget, applyPath, argumentsList);
+
+    				let result = Reflect.apply(
+    					target,
+    					smartClone.preferredThisArg(target, thisArg, thisProxyTarget),
+    					isHandledMethod
+    						? argumentsList.map(argument => getProxyTarget(argument))
+    						: argumentsList,
+    				);
+
+    				const isChanged = smartClone.isChanged(thisProxyTarget, equals);
+    				const previous = smartClone.stop();
+
+    				if (SmartClone.isHandledType(result) && isHandledMethod) {
+    					if (thisArg instanceof Map && target.name === 'get') {
+    						applyPath = path.concat(applyPath, argumentsList[0]);
+    					}
+
+    					result = cache.getProxy(result, applyPath, handler);
+    				}
+
+    				if (isChanged) {
+    					const applyData = {
+    						name: target.name,
+    						args: argumentsList,
+    						result,
+    					};
+    					const changePath = smartClone.isCloning
+    						? path.initial(applyPath)
+    						: applyPath;
+    					const property = smartClone.isCloning
+    						? path.last(applyPath)
+    						: '';
+
+    					if (validate(path.get(object, changePath), property, thisProxyTarget, previous, applyData)) {
+    						handleChange(changePath, property, thisProxyTarget, previous, applyData);
+    					} else {
+    						smartClone.undo(thisProxyTarget);
+    					}
+    				}
+
+    				if (
+    					(thisArg instanceof Map || thisArg instanceof Set)
+    					&& isIterator(result)
+    				) {
+    					return wrapIterator(result, target, thisArg, applyPath, prepareValue);
+    				}
+
+    				return result;
+    			}
+
+    			return Reflect.apply(target, thisArg, argumentsList);
+    		},
+    	};
+
+    	const proxy = cache.getProxy(object, options.pathAsArray ? [] : '', handler);
+    	onChange = onChange.bind(proxy);
+
+    	if (hasOnValidate) {
+    		options.onValidate = options.onValidate.bind(proxy);
+    	}
+
+    	return proxy;
+    };
+
+    onChange.target = proxy => proxy?.[TARGET] ?? proxy;
+    onChange.unsubscribe = proxy => proxy?.[UNSUBSCRIBE] ?? proxy;
+
+    class DivComponent {
+        constructor(){
+            this.el = document.createElement('div');
+        }
+
+        render(){
+            this.el;
+        }
+    }
+
+    class Header extends DivComponent {
+      constructor(appState) {
+        super();
+        this.appState = appState;
+      }
+
+      render() {
+        this.el.innerHTML = "";
+        this.el.classList.add("header");
+        this.el.innerHTML = `
+            <div>
+                <a href="/" class="logo"><b>XFR</b>.movies</a>
+            </div>
+            <nav class="menu">
+                <a class="menu__item" href="#favorites">
+                 <svg class="icon" width="24" height="24">
+                    <use xlink:href="#favorite"></use>
+                </svg>
+                 <span>Favorite</span>
+                    <div class="menu__counter">
+                        ${this.appState.favorites.length}
+                    </div>
+                </a>
+            </nav>
+        `;
+        return this.el;
+      }
+    }
+
+    class Search extends DivComponent {
+      constructor(state) {
+        super();
+        this.state = state;
+      }
+
+      search() {
+        const value = this.el.querySelector("input").value;
+        this.state.searchQuery = value;
+      }
+
+      render() {
+        this.el.classList.add("search");
+        this.el.innerHTML = `
+            <div class="search-wrapper">
+                <input type="search" placeholder="Search the movie by title..." class="search__field" value="${
+                  this.state.searchQuery ? this.state.searchQuery : ""
+                }">
+                <svg class="icon" width="24" height="24">
+                <use xlink:href="#search"></use>
+                </svg>
+                </div>
+                <button aria-label="search">
+                <svg class="icon" width="24" height="24">
+                <use xlink:href="#search"></use>
+                </svg>
+            </button>
+        `;
+        this.el.querySelector("button").addEventListener("click", this.search.bind(this));
+        this.el.querySelector("input").addEventListener("keydown", (e) => {
+          if (e.code === "Enter") {
+            this.search();
+          }
+        });
+        return this.el;
+      }
+    }
+
+    class Card extends DivComponent {
+      constructor(appState, cardState) {
+        super();
+        this.appState = appState;
+        this.cardState = cardState;
+      }
+
+      #addToFavorites() {
+        if (!this.appState.favorites.find((movie) => movie.id === this.cardState.id)) {
+          this.appState.favorites.push(this.cardState);
+        }
+      }
+
+      #deleteFromFavorites() {
+        this.appState.favorites = this.appState.favorites.filter((movie) => movie.id !== this.cardState.id);
+      }
+
+      #navigateToSingleMoviePage() {
+        // This will change the hash in the URL to route to the single movie page
+        location.hash = `#movie/${this.cardState.id}`;
+      }
+
+      render() {
+        this.el.classList.add("card");
+
+        const posterUrl = this.cardState.poster_path
+          ? `https://image.tmdb.org/t/p/w500${this.cardState.poster_path}`
+          : "https://via.placeholder.com/500x750?text=No+Image";
+
+        const isFavorite = this.appState.favorites.find((b) => b.id == this.cardState.id);
+
+        this.el.innerHTML = `
+      <div class="card__img">
+        <img src="${posterUrl}" alt="${this.cardState.title} Poster" class="card__img--poster" />
+        <button class="card__btn ${isFavorite ? "active" : ""}">
+            <svg class="icon" width="24" height="24">
+                <use xlink:href="#favorite"></use>
+            </svg>
+        </button>
+      </div>
+      <div class="card__info">
+        <div class="card__tag">${this.cardState.genre_ids ? this.getGenres(this.cardState.genre_ids) : "N/D"}</div>
+        <div class="card__name">${this.cardState.title}</div>
+        <div class="card__release-date">${this.cardState.release_date || "N/D"}</div>
+      </div>
+    `;
+
+        this.el.querySelector(".card__img").addEventListener("click", this.#navigateToSingleMoviePage.bind(this));
+        this.el.querySelector(".card__info").addEventListener("click", this.#navigateToSingleMoviePage.bind(this));
+
+        if (isFavorite) {
+          this.el.querySelector("button").addEventListener("click", this.#deleteFromFavorites.bind(this));
+        } else {
+          this.el.querySelector("button").addEventListener("click", this.#addToFavorites.bind(this));
+        }
+
+        return this.el;
+      }
+
+      getGenres(genreIds) {
+        const genres = {
+          28: "Action",
+          12: "Adventure",
+          16: "Animation",
+          35: "Comedy",
+          80: "Crime",
+          99: "Documentary",
+          18: "Drama",
+          10751: "Family",
+          14: "Fantasy",
+          36: "History",
+          27: "Horror",
+          10402: "Music",
+          9648: "Mystery",
+          10749: "Romance",
+          878: "Science Fiction",
+          10770: "TV Movie",
+          53: "Thriller",
+          10752: "War",
+          37: "Western",
+        };
+
+        return genreIds.map((id) => genres[id] || "Unknown").join(", ");
+      }
+    }
+
+    class CardList extends DivComponent {
+        constructor(appState, parentState) {
+            super();
+            this.appState = appState;
+            this.parentState = parentState;
+        }
+
+        render() {
+            if (this.parentState.loading) {
+                this.el.innerHTML = `<div class="card-list__loader">Loading...</div>`;
+                return this.el;
+            }
+            this.el.classList.add("card-list");
+           
+
+            const section = document.createElement('section');
+            section.classList.add('cards');
+            this.el.append(section);
+
+            for (const card of this.parentState.list) {
+                const cardItem = new Card(this.appState, card);
+                section.append(cardItem.render());
+            }
+            return this.el;
+        }
+    }
+
+    class MainView extends AbstractView {
+      state = {
+        list: [],
+        numFound: 0,
+        totalPages: 0, // Total pages available for the search
+        loading: false,
+        searchQuery: "", // Start with an empty search query
+        page: 1, // Start at page 1
+        itemsPerPage: 8, // Show 8 items per page
+      };
+
+      constructor(appState) {
+        super();
+        this.appState = appState;
+        this.appState = onChange(this.appState, this.appStateHook.bind(this));
+        this.state = onChange(this.state, this.stateHook.bind(this));
+        this.setTitle("Movies searching");
+
+        // Load random movies when the page first loads
+        this.loadRandomMovies();
+      }
+
+      destroy() {
+        onChange.unsubscribe(this.appState);
+        onChange.unsubscribe(this.state);
+      }
+
+      appStateHook(path) {
+        console.log(path);
+        if (path === "favorites") {
+          this.render();
+        }
+      }
+
+      async loadList(q, page) {
+        const res = await fetch(
+          `https://api.themoviedb.org/3/search/movie?api_key=37ed43a4f8eaa2abd75f9283692947bc&language=en-US&page=${page}&query=${q}`
+        );
+        return res.json();
+      }
+
+      getRandomQuery() {
+        const randomQueries = ["action", "comedy", "drama", "romance", "horror", "adventure"];
+        return randomQueries[Math.floor(Math.random() * randomQueries.length)];
+      }
+
+      async loadRandomMovies() {
+        // Load random movies on first load or when search is cleared
+        const randomQuery = this.getRandomQuery();
+        this.state.searchQuery = ""; // Ensure the search query is empty
+        this.state.page = 1; // Reset to the first page
+        await this.fetchMovies(randomQuery); // Fetch random movies
+      }
+
+      async fetchMovies(query) {
+        this.state.loading = true;
+        const data = await this.loadList(query, this.state.page);
+        this.state.loading = false;
+
+        this.state.numFound = data.total_results;
+        this.state.totalPages = data.total_pages;
+        this.state.list = data.results;
+      }
+
+      async stateHook(path) {
+        if (path === "searchQuery" || path === "page") {
+          // If the search query is empty, load random movies
+          if (!this.state.searchQuery) {
+            await this.loadRandomMovies();
+          } else {
+            // If there is a search query, fetch movies based on the query
+            await this.fetchMovies(this.state.searchQuery);
+          }
+        }
+
+        if (path === "list" || path === "loading") {
+          this.render();
+        }
+      }
+
+      render() {
+        const main = document.createElement("div");
+
+        // Search component with empty value
+        const searchComponent = new Search(this.state).render();
+        main.append(searchComponent);
+
+        // Only show "Movies found" and pagination if there are search results or after a search
+        if (this.state.searchQuery) {
+          const movieCount = document.createElement("h1");
+          movieCount.textContent = `Movies found: ${this.state.numFound}`;
+          main.append(movieCount);
+
+          // Pagination before cards
+          const paginationBefore = this.createPagination();
+          main.append(paginationBefore);
+        }
+
+        // Card list component
+        const cardList = new CardList(this.appState, this.state).render();
+        main.append(cardList);
+
+        // Only show pagination after cards if there are search results
+        if (this.state.searchQuery) {
+          const paginationAfter = this.createPagination();
+          main.append(paginationAfter);
+        }
+
+        this.app.innerHTML = "";
+        this.app.append(main);
+
+        this.renderHeader();
+      }
+
+      createPagination() {
+        const paginationContainer = document.createElement("nav");
+        paginationContainer.classList.add("pagination");
+
+        // Previous button
+        const prevButton = document.createElement("button");
+        prevButton.textContent = "Previous";
+        prevButton.disabled = this.state.page <= 1;
+        prevButton.addEventListener("click", () => {
+          if (this.state.page > 1) {
+            this.state.page -= 1;
+          }
+        });
+
+        // Next button
+        const nextButton = document.createElement("button");
+        nextButton.textContent = "Next";
+        nextButton.disabled = this.state.page >= this.state.totalPages;
+        nextButton.addEventListener("click", () => {
+          if (this.state.page < this.state.totalPages) {
+            this.state.page += 1;
+          }
+        });
+
+        paginationContainer.append(prevButton, nextButton);
+
+        return paginationContainer;
+      }
+
+      renderHeader() {
+        const header = new Header(this.appState).render();
+        this.app.prepend(header);
+      }
+    }
+
+    class SingleMovieView extends AbstractView {
+      constructor(appState, params) {
+        super();
+        this.appState = appState;
+        this.params = params;
+        this.setTitle("Movie Details");
+      }
+
+      async fetchMovieDetails(id) {
+        const res = await fetch(
+          `https://api.themoviedb.org/3/movie/${id}?api_key=37ed43a4f8eaa2abd75f9283692947bc&language=en-US`
+        );
+        return res.json();
+      }
+
+      async render() {
+        const movieData = await this.fetchMovieDetails(this.params.id);
+        console.log("movieData", movieData);
+
+        const main = document.createElement("div");
+        main.classList.add("page_single");
+
+        // Movie Title
+        const movieTitle = document.createElement("h1");
+        movieTitle.textContent = movieData.title;
+        main.appendChild(movieTitle);
+
+        // Movie Poster
+        const moviePoster = document.createElement("img");
+        moviePoster.src = `https://image.tmdb.org/t/p/w500${movieData.poster_path}`;
+        moviePoster.alt = `${movieData.title} Poster`;
+        main.appendChild(moviePoster);
+
+        // Movie Overview
+        const movieDescription = document.createElement("p");
+        movieDescription.textContent = movieData.overview;
+        main.appendChild(movieDescription);
+
+        // Movie Budget
+        const movieBudget = document.createElement("p");
+        movieBudget.textContent = `Budget: $${movieData.budget.toLocaleString()}`;
+        main.appendChild(movieBudget);
+
+        // Movie Release Date
+        const movieReleaseDate = document.createElement("p");
+        movieReleaseDate.textContent = `Release Date: ${movieData.release_date}`;
+        main.appendChild(movieReleaseDate);
+
+        // Movie Runtime
+        const movieRuntime = document.createElement("p");
+        movieRuntime.textContent = `Runtime: ${movieData.runtime} minutes`;
+        main.appendChild(movieRuntime);
+
+        // Movie Genres
+        const movieGenres = document.createElement("p");
+        const genres = movieData.genres.map((genre) => genre.name).join(", ");
+        movieGenres.textContent = `Genres: ${genres}`;
+        main.appendChild(movieGenres);
+
+        // Movie Vote Average
+        const movieVoteAverage = document.createElement("p");
+        movieVoteAverage.textContent = `Vote Average: ${movieData.vote_average}`;
+        main.appendChild(movieVoteAverage);
+
+        // Movie Vote Count
+        const movieVoteCount = document.createElement("p");
+        movieVoteCount.textContent = `Vote Count: ${movieData.vote_count}`;
+        main.appendChild(movieVoteCount);
+
+        // Adding the main content to the page
+        this.app.innerHTML = "";
+        this.app.append(main);
+
+        this.renderHeader();
+      }
+
+      renderHeader() {
+        const header = new Header(this.appState).render();
+        this.app.prepend(header);
+      }
+    }
+
+    class FavoritesView extends AbstractView  {
+       
+        constructor (appState){
+            super();
+            this.appState = appState;
+            this.appState = onChange(this.appState, this.appStateHook.bind(this));
+            this.setTitle('My favorites');
+        }
+
+        destroy(){
+            onChange.unsubscribe(this.appState);
+            onChange.unsubscribe(this.state);
+        }
+
+        appStateHook(path){
+            console.log(path);
+            if(path === 'favorites'){
+               this.render();
+            }
+        }
+
+        render() {
+            const main = document.createElement('div');
+            
+            main.innerHTML = `
+        <h1>Favorites</h1>
+        `;
+
+            const cardList = new CardList(this.appState, {list: this.appState.favorites}).render();
+            main.append(cardList);
+
+            const countElement = document.createElement('div');
+            // countElement.textContent = `Books count: ${this.appState.favorites.length}`;
+            
+            main.append(countElement);
+            
+            this.app.innerHTML = '';
+            this.app.append(main);
+            
+            this.renderHeader();
+        }
+        
+
+        renderHeader(){
+            const header = new Header(this.appState).render();
+            this.app.prepend(header);
+        }
+    }
+
+    class App {
+        routes = [
+            { path: '', view: MainView }, 
+            { path: '#movie/:id', view: SingleMovieView },
+            { path: '#favorites', view: FavoritesView } 
+        ];
+
+        appState = {
+            favorites: []
+        };
+
+        constructor() {
+            window.addEventListener('hashchange', this.route.bind(this));
+            this.route();
+        }
+
+        route() {
+            if (this.currentView) {
+                this.currentView.destroy(); 
+            }
+
+            const hash = location.hash;
+
+            const route = this.routes.find(r => this.matchRoute(r.path, hash));
+
+            if (route) {
+                const params = this.extractParams(route.path, hash);
+                this.currentView = new route.view(this.appState, params);
+                this.currentView.render();
+            }
+        }
+
+        matchRoute(routePath, hash) {
+            const routeRegex = new RegExp('^' + routePath.replace(/:id/, '(\\d+)') + '$');
+            return routeRegex.test(hash);
+        }
+
+        extractParams(routePath, hash) {
+            const routeRegex = new RegExp('^' + routePath.replace(/:id/, '(\\d+)') + '$');
+            const match = hash.match(routeRegex);
+            if (match) {
+                return { id: match[1] }; 
+            }
+            return {}; 
+        }
+    }
+
+    new App();
+
+})();
