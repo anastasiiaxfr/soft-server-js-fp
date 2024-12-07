@@ -48,7 +48,7 @@ export class Card extends DivComponent {
       </div>
     `;
 
-    this.el.querySelector(".card__img").addEventListener("click", this.#navigateToSingleMoviePage.bind(this));
+    
     this.el.querySelector(".card__info").addEventListener("click", this.#navigateToSingleMoviePage.bind(this));
 
     if (isFavorite) {
